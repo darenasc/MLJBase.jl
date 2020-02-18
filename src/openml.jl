@@ -24,7 +24,11 @@ information about the creator, URL to download it and more.
 112 - No access granted. This dataset is not shared with you.
 """
 function load_Dataset_Description(id::Int; api_key::String="")
-    url = string(API_URL, "/data/$id")
+    if api_key == ""
+        url = string(API_URL, "/data/$id")
+    elseif length(api_key) > 0
+        url = string(API_URL, "/data/$id?api_key=$api_key")
+    end
     try
         r = HTTP.request("GET", url)
         if r.status == 200
@@ -49,41 +53,71 @@ Receives an `HTTP.Message.response` that has an
 ARFF file format in the `body` of the `Message`.
 """
 function convert_ARFF_to_rowtable(response)
-    data = String(response.body)
-    data2 = split(data, "\n")
+    header, data = split(lowercase(String(response.body)), "@data")
 
-    featureNames = String[]
-    dataTypes = String[]
-    # TODO: make this more performant by anticipating types?
-    named_tuples = [] # `Any` type here bad
-    for line in data2
+    header = split(header, "\n")
+    data = split(data, "\n")
+    data = [x for x in data if length(x) > 0]
+    n_rows = length(data)
+
+    # HEADER processing
+    feature_names = String[]
+    data_types = []
+    for line in header
         if length(line) > 0
+            # ignore line if it is a comment staring with "%"
             if line[1:1] != "%"
-                d = []
                 if occursin("@attribute", lowercase(line))
-                    push!(featureNames, replace(split(line, " ")[2], "'" => ""))
-                    push!(dataTypes, split(line, " ")[3])
+                    push!(feature_names, replace(split(line, " ")[2], "'" => ""))
+                    push!(data_types, split(line, " ")[3])
                 elseif occursin("@relation", lowercase(line))
                     nothing
-                elseif occursin("@data", lowercase(line))
-                    # it means the data starts
-                    nothing
                 else
-                    values = split(line, ",")
-                    for i in eachindex(featureNames)
-                        if lowercase(dataTypes[i]) in ["real","numeric"]
-                            push!(d, featureNames[i] => Meta.parse(values[i]))
-                        else
-                            # all the rest will be considered as String
-                            push!(d, featureNames[i] => values[i])
-                        end
-                    end
-                    push!(named_tuples, (; (Symbol(k) => v for (k,v) in d)...))
+                    nothing
                 end
             end
         end
     end
-    return identity.(named_tuples) # not performant; see above
+
+    # feature names and data types
+    feature_names_symbols = Tuple(Symbol.(feature_names))
+    dts = []
+    for dt in data_types
+        if lowercase(dt) in ["real", "numeric"]
+            push!(dts, Float64)
+        else
+            push!(dts, String)
+        end
+    end
+
+    # declaration of the named tuples
+    named_tuples = Vector{NamedTuple{feature_names_symbols}{Tuple{dts...}}}(undef, n_rows)
+
+    # DATA processing
+    for i in eachindex(data)
+        values = split(data[i], ",")
+        row = []
+        for i in eachindex(feature_names)
+            if lowercase(data_types[i]) in ["real","numeric"]
+                push!(row, Meta.parse(values[i]))
+            else
+                # all the rest will be considered as String
+                push!(row, values[i])
+            end
+        end
+        named_tuples[i] = NamedTuple{feature_names_symbols}{Tuple{dts...}}((row))
+    end
+    return named_tuples
+end
+
+function describe_dataset(dict)
+    @info """\"$(dict["data_set_description"]["name"])\" dataset info:"""
+    for k in eachindex(dict["data_set_description"])
+        if !(k in ["description", "tag"])
+            # description can be too long to print it
+            @info """$k : $(dict["data_set_description"][k])"""
+        end
+    end
 end
 
 """
@@ -104,12 +138,21 @@ example:
     df2 = coerce(df, :class=>Multiclass)
 
 """
-function load(id::Int)
-    response = load_Dataset_Description(id)
-    arff_file = HTTP.request("GET", response["data_set_description"]["url"])
-    return convert_ARFF_to_rowtable(arff_file)
+function load(id::Int; api_key::String = "", download::Bool = true)
+    if api_key == ""
+        response = load_Dataset_Description(id)
+    else
+        response = load_Dataset_Description(id, api_key = api_key)
+    end
+    if download == true
+        @info """Downloading \"$(response["data_set_description"]["name"])\" dataset..."""
+        arff_file = HTTP.request("GET", response["data_set_description"]["url"])
+        return convert_ARFF_to_rowtable(arff_file)
+    else
+        describe_dataset(response)
+    end
+    return nothing
 end
-
 
 """
 Returns a list of all data qualities in the system.
